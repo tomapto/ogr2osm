@@ -44,6 +44,7 @@ Based very heavily on code released under the following terms:
 
 import sys
 import os
+import psycopg2
 from optparse import OptionParser
 import logging as l
 
@@ -90,27 +91,23 @@ try:
 except:
     parser.error("EPSG code must be numeric (e.g. '4326', not 'epsg:4326')")
 
-if len(args) < 3:
-    parser.print_help()
-    parser.error("you must specify a source filename")
-elif len(args) > 3:
-    parser.error("you have specified too many arguments, " +
-                 "only supply the source filename")
-
 # Input and output file
 # if no output file given, use the basename of the source but with .osm
-sourceFile = os.path.realpath(args[0])
-sourceFile1 = os.path.realpath(args[1])
-sourceFile2 = os.path.realpath(args[2])
+# 需要使用的图层
+#
+# rheilongjiang R_LName R_Name n z z_index
 
-if options.outputFile is not None:
-    options.outputFile = os.path.realpath(options.outputFile)
-else:
-    (base, ext) = os.path.splitext(os.path.basename(sourceFile))
-    options.outputFile = os.path.join(os.getcwd(), base + ".osm")
+conn = psycopg2.connect(host="t0.map.design",user="postgres",password="***",database="basemap")
+datasource = ogr.Open("PG:dbname=basemap host=t0.map.design port=5432 user=postgres password=***")
+rlayer = datasource.GetLayerByName("r")
+nlayer = datasource.GetLayerByName("n")
+zlayer = datasource.GetLayerByName("z_level")
+
+options.outputFile = "output.osm"
+
 if not options.forceOverwrite and os.path.exists(options.outputFile):
     parser.error("ERROR: output file '%s' exists" % (options.outputFile))
-l.info("Preparing to convert file '%s' to '%s'." % (sourceFile, options.outputFile))
+l.info("Preparing to convert file '%s' to '%s'." % ("postgis", options.outputFile))
 
 # Projection
 if not options.sourcePROJ4 and not options.sourceEPSG:
@@ -198,9 +195,6 @@ zpoints = {}
 # Helper function to get a new ID
 elementIdCounter = 0
 
-layer1 = ogr.Open("./hljsrc/R_LNameheilongjiang.dbf", 0).GetLayer()
-layer2 = ogr.Open("./hljsrc/R_Nameheilongjiang.dbf", 0).GetLayer()
-
 def getNewID():
     global elementIdCounter
     elementIdCounter -= 1
@@ -279,8 +273,8 @@ class Feature(object):
 
 
 def getzPoint():
-    dataSource1 = ogr.Open('hljsrc/Nhlj2.shp', 0)
-    layer1 = dataSource1.GetLayer()
+    l.debug("getzPoint")
+    layer1 = nlayer
     lids = {}
     jj = 0
     for i in range(layer1.GetFeatureCount()):
@@ -288,7 +282,7 @@ def getzPoint():
         if ogrfeature1 is None:
             continue
 
-        lid1 = ogrfeature1.GetFieldAsString("Node_LID");
+        lid1 = ogrfeature1.GetFieldAsString("Node_LID")
         if lid1 == '':
             continue
         ogrgeometry1 = ogrfeature1.GetGeometryRef()
@@ -299,15 +293,14 @@ def getzPoint():
             x1 = ogrgeometry1.GetX()
             y1 = ogrgeometry1.GetY()
             lids[lid1] = (x1,y1)
-    dataSource = ogr.Open('hljsrc/z_hlj2.shp', 0)
-    layer = dataSource.GetLayer()
 
+    layer = zlayer
     for i in range(layer.GetFeatureCount()):
         ogrfeature = layer.GetNextFeature()
-        z = ogrfeature.GetFieldAsString("Z");
+        z = ogrfeature.GetFieldAsString("Z")
         if z == '1':
-            id = ogrfeature.GetFieldAsString("ID");
-            snum = ogrfeature.GetFieldAsString("Seq_Nm");
+            id = ogrfeature.GetFieldAsString("ID")
+            snum = ogrfeature.GetFieldAsString("Seq_Nm")
             zpoints[jj] = id + "|" + snum
             jj +=1
 
@@ -320,7 +313,7 @@ def getzPoint():
                 y = ogrgeometry.GetY()
 
             for (a, b) in lids.items():
-                ids = a.split("|");
+                ids = a.split("|")
                 if b == (x,y) and ids[0] == id:
                     zpoints[jj] = ids[1]+'|0'
                     jj += 1
@@ -330,30 +323,14 @@ def getzPoint():
                     jj += 1
     return zpoints
 
-def getFileData(filename,filename1,filename2):
-    if not os.path.isfile(filename):
-        parser.error("the file '%s' does not exist" % (filename))
-
-    ''' 打开3个文件 R  R_LName R_Name'''
-    dataSource = ogr.Open(filename, 0)  # 0 means read-only
-    dataSource1 = ogr.Open(filename1, 0)  # 0 means read-only
-    dataSource2 = ogr.Open(filename2, 0)  # 0 means read-only
-
-    if dataSource is None:
-        l.error('OGR failed to open ' + filename + ', format may be unsuported')
-        sys.exit(1)
-    return dataSource,dataSource1,dataSource2
-
-
-def parseData(dataSource,dataSource1,dataSource2):
+def parseData():
     l.debug("Parsing data")
     getzPoint()
     global translations
-    for i in range(dataSource.GetLayerCount()):
-        layer = dataSource.GetLayer(i)
-        layer.ResetReading()
-        parseLayer(translations.filterLayer(layer),dataSource1,dataSource2)
 
+    rlayer.ResetReading()
+    parseLayer(translations.filterLayer(rlayer))
+    conn.close()
 
 def getTransform(layer):
     global options
@@ -397,7 +374,7 @@ def getLayerFields(layer):
         fieldNames.append(featureDefinition.GetFieldDefn(j).GetNameRef())
     return fieldNames
 
-def getFeatureTags(ogrfeature, fieldNames,dataSource1,dataSource2):
+def getFeatureTags(ogrfeature):
     tags = {}
     strID = ogrfeature.GetFieldAsString("ID");
     strDirection = ogrfeature.GetFieldAsString("Direction");
@@ -414,21 +391,13 @@ def getFeatureTags(ogrfeature, fieldNames,dataSource1,dataSource2):
         tags['oneway'] = 'no'
         tags['rDirection'] = 'no'
 
-    '''
-    layer1 = dataSource1.GetLayer()
-    layer2 = dataSource2.GetLayer()
-    layer1.SetAttributeFilter("ID = '"+ strID + "'" );
+    cur = conn.cursor()
+    cur.execute(
+        "select PathName from r_lname left outer join r_name on r_lname.Route_ID= r_name.Route_ID where r_lname.ID = '%s' and r_name.Language ='1'" % strID)
+    rows = cur.fetchall()
+    if(len(rows) == 1):
+        tags['name'] = rows[0][0]
 
-    strRouteID = "";
-    for feature in layer1:
-        strRouteID = feature.GetFieldAsString("Route_ID");
-
-    if strRouteID != "":
-        layer2.SetAttributeFilter("Route_ID = '"+ strRouteID + "'" + "and Language = '1'")
-        for feature in layer2:
-            tags['name'] = unicode(feature.GetFieldAsString("PathName"),'gbk')
-    '''
-    tags['name'] = u'河西路'
     tags['id'] = strID
     strKind = ogrfeature.GetFieldAsString("Kind").split("|")[0][0:2]
     strKind2 = ogrfeature.GetFieldAsString("Kind").split("|")[0][2:4]
@@ -459,18 +428,21 @@ def getFeatureTags(ogrfeature, fieldNames,dataSource1,dataSource2):
     return translations.filterTags(tags)
 
 
-def parseLayer(layer,dataSource1,dataSource2):
+def parseLayer(layer):
+    l.debug("parseLayer")
     if layer is None:
         return
     fieldNames = getLayerFields(layer)
     reproject = getTransform(layer)
-
+    nCount = 0
     for j in range(layer.GetFeatureCount()):
         ogrfeature = layer.GetNextFeature()
-        parseFeature(translations.filterFeature(ogrfeature, fieldNames, reproject), fieldNames, reproject,dataSource1,dataSource2)
+        l.debug("parser feature %d",nCount)
+        nCount = nCount + 1
+        parseFeature(translations.filterFeature(ogrfeature, fieldNames, reproject), reproject)
 
 
-def parseFeature(ogrfeature, fieldNames, reproject,dataSource1,dataSource2):
+def parseFeature(ogrfeature, reproject):
     if ogrfeature is None:
         return
 
@@ -484,7 +456,7 @@ def parseFeature(ogrfeature, fieldNames, reproject,dataSource1,dataSource2):
 
     feature = Feature()
     feature.geometry = geometry
-    feature.tags = getFeatureTags(ogrfeature, fieldNames,dataSource1,dataSource2)
+    feature.tags = getFeatureTags(ogrfeature)
     geometry.addparent(feature)
 
     translations.filterFeaturePost(feature, ogrfeature, ogrgeometry)
@@ -677,8 +649,7 @@ def output():
 
 
 # Main flow
-data,data1,data2 = getFileData(sourceFile,sourceFile1,sourceFile2)
-parseData(data,data1,data2)
+parseData()
 mergePoints()
 translations.preOutputTransform(geometries, features)
 output()
